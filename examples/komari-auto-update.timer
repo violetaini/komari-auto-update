@@ -1,0 +1,13 @@
+[Unit]
+Description=Komari Monitor server auto-update check every 6 hours
+
+[Timer]
+OnBootSec=10m
+OnUnitActiveSec=6h
+RandomizedDelaySec=10m
+AccuracySec=1m
+Persistent=true
+Unit=komari-auto-update.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG_FILE="${CONFIG_FILE:-/etc/komari-auto-update.conf}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+KOMARI_BIN="${KOMARI_BIN:-/opt/komari/komari}"
+KOMARI_SERVICE="${KOMARI_SERVICE:-komari.service}"
+KOMARI_API="${KOMARI_API:-http://127.0.0.1:25774/api/version}"
+GITHUB_RELEASES_API="${GITHUB_RELEASES_API:-https://api.github.com/repos/komari-monitor/komari/releases?per_page=100}"
+BACKUP_DIR="${BACKUP_DIR:-/opt/komari/backups/auto-update}"
+LOCK_FILE="${LOCK_FILE:-/run/komari-auto-update.lock}"
+KEEP_BACKUPS="${KEEP_BACKUPS:-2}"
+
+DRY_RUN=0
+
+usage() {
+  cat <<'EOF'
+Usage: komari-auto-update [--dry-run]
+
+Checks the official Komari GitHub releases, compares only stable semver
+releases against the currently running server version, and updates the Komari
+server binary when a newer stable release exists.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+log() {
+  printf '%s %s\n' "$(date -Is)" "$*"
+}
+
+die() {
+  log "ERROR: $*"
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
+
+normalize_version() {
+  local version="${1#v}"
+  if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    printf '%s\n' "${BASH_REMATCH[0]}"
+    return 0
+  fi
+  return 1
+}
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)
+      printf 'amd64\n'
+      ;;
+    aarch64|arm64)
+      printf 'arm64\n'
+      ;;
+    i386|i686)
+      printf '386\n'
+      ;;
+    riscv64)
+      printf 'riscv64\n'
+      ;;
+    *)
+      die "Unsupported architecture: $(uname -m)"
+      ;;
+  esac
+}
+
+get_current_version() {
+  local api_json version out
+
+  if api_json="$(curl -fsS --max-time 10 "$KOMARI_API" 2>/dev/null)"; then
+    version="$(jq -r '.data.version // empty' <<<"$api_json")"
+    if [[ -n "$version" ]]; then
+      normalize_version "$version"
+      return
+    fi
+  fi
+
+  out="$(timeout 10 "$KOMARI_BIN" --version 2>&1 || true)"
+  version="$(sed -n 's/.*Komari Monitor \([0-9][0-9.]*\).*/\1/p' <<<"$out" | head -n 1)"
+  if [[ -n "$version" ]]; then
+    normalize_version "$version"
+    return
+  fi
+
+  return 1
+}
+
+select_target_release() {
+  local current_version="$1"
+  jq -c --arg current "$current_version" '
+    def parsev:
+      tostring
+      | ltrimstr("v")
+      | capture("^(?<major>[0-9]+)\\.(?<minor>[0-9]+)\\.(?<patch>[0-9]+)")?
+      | if . == null then null else [.major, .minor, .patch] | map(tonumber) end;
+
+    def semver_gt($a; $b):
+      ($a[0] > $b[0])
+      or ($a[0] == $b[0] and $a[1] > $b[1])
+      or ($a[0] == $b[0] and $a[1] == $b[1] and $a[2] > $b[2]);
+
+    ($current | parsev) as $cur
+    | if $cur == null then
+        empty
+      else
+        [
+          .[]
+          | select((.draft | not) and (.prerelease | not))
+          | (.tag_name // .name // "") as $tag
+          | ($tag | parsev) as $ver
+          | select($ver != null and semver_gt($ver; $cur))
+          | {
+              tag: $tag,
+              version: ($tag | ltrimstr("v")),
+              version_tuple: $ver,
+              html_url,
+              published_at,
+              assets
+            }
+        ]
+        | sort_by(.version_tuple[0], .version_tuple[1], .version_tuple[2])
+        | last
+      end
+  '
+}
+
+cleanup_old_backups() {
+  local pattern="$1"
+  local old
+  mapfile -t old < <(
+    find "$BACKUP_DIR" -maxdepth 1 -type f -name "$pattern" -printf '%T@ %p\n' \
+      | sort -nr \
+      | tail -n "+$((KEEP_BACKUPS + 1))" \
+      | cut -d' ' -f2-
+  )
+  if [[ "${#old[@]}" -gt 0 ]]; then
+    rm -f -- "${old[@]}"
+  fi
+}
+
+main() {
+  require_cmd curl
+  require_cmd jq
+  require_cmd flock
+  require_cmd systemctl
+  require_cmd timeout
+  require_cmd tar
+  require_cmd install
+
+  [[ -x "$KOMARI_BIN" ]] || die "Komari binary is not executable: $KOMARI_BIN"
+
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    log "Another Komari update check is already running; exiting."
+    exit 0
+  fi
+
+  local current_version releases_json target_json target_version target_tag arch asset_name asset_url
+  current_version="$(get_current_version)" || die "Unable to determine current Komari version"
+
+  log "Current Komari version: ${current_version}"
+  releases_json="$(curl -fsS --retry 3 --retry-delay 3 -H 'Accept: application/vnd.github+json' "$GITHUB_RELEASES_API")"
+  target_json="$(select_target_release "$current_version" <<<"$releases_json")"
+
+  if [[ -z "$target_json" || "$target_json" == "null" ]]; then
+    log "No newer stable Komari release found."
+    exit 0
+  fi
+
+  target_version="$(jq -r '.version' <<<"$target_json")"
+  target_tag="$(jq -r '.tag' <<<"$target_json")"
+  arch="$(detect_arch)"
+  asset_name="komari-linux-${arch}"
+  asset_url="$(jq -r --arg name "$asset_name" '.assets[]? | select(.name == $name) | .browser_download_url' <<<"$target_json" | head -n 1)"
+  [[ -n "$asset_url" && "$asset_url" != "null" ]] || die "Release ${target_tag} does not contain asset ${asset_name}"
+
+  log "New stable Komari release found: ${current_version} -> ${target_version} (${target_tag})"
+  log "Release URL: $(jq -r '.html_url' <<<"$target_json")"
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    log "Dry run: would download ${asset_url} and update ${KOMARI_BIN}."
+    exit 0
+  fi
+
+  local tmpdir download_file service_was_active komari_dir data_dir ts binary_backup data_backup verified_version
+  tmpdir="$(mktemp -d)"
+  download_file="${tmpdir}/${asset_name}"
+  service_was_active=0
+  komari_dir="$(dirname "$KOMARI_BIN")"
+  data_dir="${komari_dir}/data"
+  ts="$(date +%Y%m%d_%H%M%S)"
+  binary_backup="${BACKUP_DIR}/komari.${current_version}.${ts}"
+  data_backup="${BACKUP_DIR}/data.${current_version}.${ts}.tar.gz"
+
+  cleanup_tmp() {
+    rm -rf "$tmpdir"
+  }
+  trap cleanup_tmp EXIT
+
+  mkdir -p "$BACKUP_DIR"
+
+  log "Downloading ${asset_name} for ${target_tag}."
+  curl -fL --retry 3 --retry-delay 3 -o "$download_file" "$asset_url"
+  chmod 0755 "$download_file"
+
+  if cmp -s "$download_file" "$KOMARI_BIN"; then
+    log "Downloaded binary matches the current binary; no replacement needed."
+    exit 0
+  fi
+
+  if systemctl is-active --quiet "$KOMARI_SERVICE"; then
+    service_was_active=1
+  else
+    die "${KOMARI_SERVICE} is not active; refusing to update a stopped service"
+  fi
+
+  restore_data_backup() {
+    local resolved_komari_dir resolved_data_dir
+    resolved_komari_dir="$(readlink -f "$komari_dir")"
+    resolved_data_dir="$(readlink -m "$data_dir")"
+    [[ "$resolved_data_dir" == "${resolved_komari_dir}/data" ]] || die "Unsafe data directory path: ${data_dir}"
+
+    if [[ -f "$data_backup" ]]; then
+      rm -rf -- "$resolved_data_dir"
+      tar -C "$resolved_komari_dir" -xzf "$data_backup"
+    fi
+  }
+
+  rollback() {
+    log "Rolling back Komari update."
+    systemctl stop "$KOMARI_SERVICE" >/dev/null 2>&1 || true
+    if [[ -f "$binary_backup" ]]; then
+      install -m 0755 "$binary_backup" "$KOMARI_BIN"
+    fi
+    restore_data_backup || true
+    if [[ "$service_was_active" -eq 1 ]]; then
+      systemctl start "$KOMARI_SERVICE" >/dev/null 2>&1 || true
+    fi
+  }
+
+  log "Stopping ${KOMARI_SERVICE} for backup and replacement."
+  systemctl stop "$KOMARI_SERVICE"
+
+  log "Backing up current binary to ${binary_backup}."
+  cp -a "$KOMARI_BIN" "$binary_backup"
+
+  if [[ -d "$data_dir" ]]; then
+    log "Backing up data directory to ${data_backup}."
+    tar -C "$komari_dir" -czf "$data_backup" data
+  else
+    log "Data directory ${data_dir} not found; skipping data backup."
+  fi
+
+  log "Installing Komari ${target_version}."
+  install -m 0755 "$download_file" "$KOMARI_BIN"
+
+  log "Starting ${KOMARI_SERVICE}."
+  if ! systemctl start "$KOMARI_SERVICE"; then
+    rollback
+    die "Failed to start ${KOMARI_SERVICE} after update"
+  fi
+
+  sleep 3
+  verified_version="$(get_current_version || true)"
+  if [[ "$verified_version" != "$target_version" ]]; then
+    rollback
+    die "Version verification failed: expected ${target_version}, got ${verified_version:-unknown}"
+  fi
+
+  cleanup_old_backups 'komari.*'
+  cleanup_old_backups 'data.*.tar.gz'
+
+  log "Komari updated successfully to ${target_version}."
+}
+
+main
