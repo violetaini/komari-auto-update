@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.svg" alt="Komari Auto Update" width="120" />
+<img src="assets/avatar.webp" alt="Komari Auto Update" width="120" />
 
 # **Komari Auto Update**
 
