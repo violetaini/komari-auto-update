@@ -20,15 +20,13 @@ if (token) {
   headers.Authorization = `Bearer ${token}`;
 }
 
-function badge(label, message, color = "blue", logo = undefined) {
-  const data = {
+function badge(label, message, color = "blue") {
+  return {
     schemaVersion: 1,
     label,
     message: String(message),
     color,
   };
-  if (logo) data.logo = logo;
-  return data;
 }
 
 async function github(path) {
@@ -78,8 +76,8 @@ async function main() {
 
   const files = {
     "version.json": badge("version", version, "8b5cf6"),
-    "stars.json": badge("stars", repoInfo.stargazers_count ?? 0, "111827", "github"),
-    "forks.json": badge("forks", repoInfo.forks_count ?? 0, "111827", "github"),
+    "stars.json": badge("stars", repoInfo.stargazers_count ?? 0, "111827"),
+    "forks.json": badge("forks", repoInfo.forks_count ?? 0, "111827"),
     "contributors.json": badge("contributors", contributorCount, "0ea5e9"),
     "commit-activity.json": badge(
       "last commit",
@@ -91,7 +89,6 @@ async function main() {
       "commit",
       Array.isArray(commits) && commits[0]?.sha ? commits[0].sha.slice(0, 7) : "unknown",
       "64748b",
-      "github",
     ),
   };
 
