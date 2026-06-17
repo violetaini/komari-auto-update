@@ -31,20 +31,43 @@ function badge(label, message, color = "blue", logo = undefined) {
   return data;
 }
 
-async function githubJson(path) {
+async function github(path) {
   const response = await fetch(`https://api.github.com${path}`, { headers });
   if (!response.ok) {
     throw new Error(`GitHub API ${response.status} for ${path}`);
   }
+  return response;
+}
+
+async function githubJson(path) {
+  const response = await github(path);
   return response.json();
+}
+
+function countFromLinkHeader(linkHeader) {
+  if (!linkHeader) return null;
+  const last = linkHeader
+    .split(",")
+    .map((part) => part.trim())
+    .find((part) => part.includes('rel="last"'));
+  const match = last?.match(/[?&]page=(\d+)/);
+  return match ? Number(match[1]) : null;
+}
+
+async function countContributors() {
+  const response = await github(`/repos/${repo}/contributors?per_page=1&anon=true`);
+  const lastPage = countFromLinkHeader(response.headers.get("link"));
+  if (lastPage !== null) return lastPage;
+  const data = await response.json();
+  return Array.isArray(data) ? data.length : 0;
 }
 
 async function main() {
   mkdirSync(badgeDir, { recursive: true });
 
-  const [repoInfo, contributors, commits] = await Promise.all([
+  const [repoInfo, contributorCount, commits] = await Promise.all([
     githubJson(`/repos/${repo}`),
-    githubJson(`/repos/${repo}/contributors?per_page=1&anon=true`),
+    countContributors(),
     githubJson(`/repos/${repo}/commits?sha=${encodeURIComponent(branch)}&per_page=1`),
   ]);
 
@@ -57,7 +80,7 @@ async function main() {
     "version.json": badge("version", version, "8b5cf6"),
     "stars.json": badge("stars", repoInfo.stargazers_count ?? 0, "111827", "github"),
     "forks.json": badge("forks", repoInfo.forks_count ?? 0, "111827", "github"),
-    "contributors.json": badge("contributors", Array.isArray(contributors) ? contributors.length : 0, "0ea5e9"),
+    "contributors.json": badge("contributors", contributorCount, "0ea5e9"),
     "commit-activity.json": badge(
       "last commit",
       daysSincePush === null ? "unknown" : daysSincePush === 0 ? "today" : `${daysSincePush}d ago`,
